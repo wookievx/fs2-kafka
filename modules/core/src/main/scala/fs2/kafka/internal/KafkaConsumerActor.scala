@@ -230,7 +230,7 @@ final private[kafka] class KafkaConsumerActor[F[_], K, V](
           res.completeWithRecords >>
           res.completeWithoutRecords >>
           res.removeRevokedRecords >>
-          onRevoked
+          onRevoked.timeout(settings.sessionTimeout) //just to be extra-safe timeout this revoke
       }
   }
 
@@ -630,7 +630,7 @@ private[kafka] object KafkaConsumerActor {
 
   final case class OnRebalance[F[_]](
     onAssigned: SortedSet[TopicPartition] => F[Unit],
-    onRevoked: SortedSet[TopicPartition] => F[Unit]
+    onRevoked: SortedSet[TopicPartition] => F[Unit],
   ) {
 
     override def toString: String =
