@@ -34,7 +34,7 @@ object RebalanceRevokeMode {
 
   /**
    * Waiting for configured amount of time:<br>
-   *   [[ConsumerSettings#withMaxPollInterval]] * 5 or until all the partition streams finish processing (but not waiting
+   *   {{{org.apache.kafka.clients.consumer.ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG}}} or until all the partition streams finish processing (but not waiting
    *    for commits to conclude for that partition)
    */
   val Graceful: RebalanceRevokeMode = GracefulMode
