@@ -8,22 +8,16 @@ package fs2.kafka
 
 import scala.collection.immutable.SortedSet
 import scala.concurrent.duration.*
-
 import cats.data.NonEmptySet
 import cats.effect.{Clock, Fiber, IO, Ref}
-import cats.effect.std.Queue
+import cats.effect.std.{Queue, Semaphore}
 import cats.effect.unsafe.implicits.global
 import cats.syntax.all.*
 import fs2.concurrent.SignallingRef
 import fs2.kafka.consumer.KafkaConsumeChunk.CommitNow
 import fs2.kafka.internal.converters.collection.*
 import fs2.Stream
-
-import org.apache.kafka.clients.consumer.{
-  ConsumerConfig,
-  CooperativeStickyAssignor,
-  NoOffsetForPartitionException
-}
+import org.apache.kafka.clients.consumer.{ConsumerConfig, CooperativeStickyAssignor, NoOffsetForPartitionException}
 import org.apache.kafka.common.errors.TimeoutException
 import org.apache.kafka.common.TopicPartition
 import org.scalatest.Assertion
@@ -71,7 +65,9 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
       }
     }
 
-    it("should consume all records at least once with subscribing for several consumers") {
+    def testMultipleConsumersCorrectConsumption(
+      customizeSettings: ConsumerSettings[IO, String, String] => ConsumerSettings[IO, String, String]
+    ) = {
       withTopic { topic =>
         createCustomTopic(topic, partitions = 3)
         val produced = (0 until 5).map(n => s"key-$n" -> s"value->$n")
@@ -79,7 +75,7 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
 
         val consumed =
           KafkaConsumer
-            .stream(consumerSettings[IO].withGroupId("test"))
+            .stream(customizeSettings(consumerSettings[IO].withGroupId("test")))
             .subscribeTo(topic)
             .evalMap(IO.sleep(3.seconds).as(_)) // sleep a bit to trigger potential race condition with _.stream
             .records
@@ -99,6 +95,14 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
         // duplication is currently possible.
         res.distinct should contain theSameElementsAs produced
       }
+    }
+
+    it("should consume all records at least once with subscribing for several consumers") {
+      testMultipleConsumersCorrectConsumption(identity)
+    }
+
+    it("should consume all records at least once with subscribing for several consumers in graceful mode") {
+      testMultipleConsumersCorrectConsumption(_.withRebalanceRevokeMode(RebalanceRevokeMode.Graceful))
     }
 
     it("should consume records with assign by partitions") {
@@ -1212,7 +1216,7 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
   }
 
   describe("KafkaConsumer#stream") {
-    it("should wait for previous generation of streams to start consuming messages with RebalanceRevokeMode#Graceful") {
+    it("should wait for previous generation of streams to finish before starting consuming messages with RebalanceRevokeMode#Graceful") {
       withTopic { topic =>
         createCustomTopic(topic, partitions = 2) //minimal amount of partitions for two consumers
         def recordRange(from: Int, _until: Int) = (from until _until).map(n => s"key-$n" -> s"value-$n")
@@ -1222,50 +1226,77 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
           publishToKafka(topic, produced)
         }
 
+        val settings = consumerSettings[IO].withGroupId("rebalance-test-group").withRebalanceRevokeMode(RebalanceRevokeMode.Graceful).withAutoOffsetReset(AutoOffsetReset.EarliestOffsetReset)
+
         // tracking consumption for being unique by explicitly commiting after each message
+        // the expected timeline looks like this:
+        // ----stream1---|locked auquired|--|producing second batch|--|rebalance-triggered|--|lock-released|---...
+        //idea is that we check if all the messages are consumed by one processor (exactly once processing implies that)
         val consumed = for {
+          lock <- Semaphore[IO](1)
           ref <- Ref.of[IO, Vector[(String, String)]](Vector.empty)
           _ <- produceRange(0, 10)
           _ <-
             KafkaConsumer
-              .stream(consumerSettings[IO].withRebalanceRevokeMode(RebalanceRevokeMode.Graceful))
+              .stream(settings)
               .evalTap(_.subscribeTo(topic))
               .flatMap(
                 _.stream
                   .evalMap { record =>
-                    ref.update(_ :+ (record.record.key -> record.record.value)).as(record.offset)
+                    lock.permit.use { _ =>
+                      ref.update(_ :+ (record.record.key -> record.record.value)).as(record)
+                    }
                   }
-                  .evalTap(_.commit)
+                  .evalMap { r =>
+                    //if key is last return none and terminate stream
+                    if (r.record.key == "key-29") {
+                      r.offset.commit.as(None)
+                    } else {
+                      r.offset.commit.as(Some(r))
+                    }
+                  }
+                  .unNoneTerminate
               )
-              .interruptAfter(3.seconds)
               .compile
               .drain
               .race {
-                Clock[IO].sleep(1.second) *>
+                Clock[IO].sleep(100.millis) *>
+                  lock.acquire *>
                   produceRange(10, 20) *>
                 KafkaConsumer
-                  .stream(consumerSettings[IO].withRebalanceRevokeMode(RebalanceRevokeMode.Graceful))
+                  .stream(settings)
                   .evalTap(_.subscribeTo(topic))
+                  .evalTap(_ => lock.release)
                   .flatMap( c =>
                     fs2.Stream.exec(produceRange(20, 30)) ++
                     c.stream
                       .evalMap { record =>
-                        ref.update(_ :+ (record.record.key -> record.record.value)).as(record.offset)
+                        ref.update(_ :+ (record.record.key -> record.record.value)).as(record)
                       }
-                      .evalTap(_.commit)
+                      .evalMap { r =>
+                        //if key is last return none and terminate stream
+                        if (r.record.key == "key-29") {
+                          r.offset.commit.as(None)
+                        } else {
+                          r.offset.commit.as(Some(r))
+                        }
+                      }
+                      .unNoneTerminate
                   )
-                  .interruptAfter(3.seconds)
                   .compile
                   .drain
               }
+              .timeout(5.seconds)
           res <- ref.get
         } yield res
 
         val res = consumed.unsafeRunSync()
 
         //expected behavior is that no duplicate consumption is performed
-        res.toSet should have size res.length.toLong
-        (res should contain).theSameElementsAs(recordRange(0, 10) ++ recordRange(10, 20) ++ recordRange(20, 30))
+        val resultSet = res.toSet
+        resultSet should have size res.length.toLong
+        val expectedSet = (recordRange(0, 10) ++ recordRange(10, 20) ++ recordRange(20, 30)).toSet
+        resultSet shouldEqual expectedSet
       }
     }
   }

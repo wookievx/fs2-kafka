@@ -12,7 +12,7 @@ import scala.collection.immutable.SortedSet
 import scala.concurrent.duration.FiniteDuration
 import scala.util.matching.Regex
 import cats.{Applicative, Foldable, Functor, Reducible}
-import cats.data.{NonEmptySet, OptionT}
+import cats.data.{Chain, NonEmptySet, OptionT}
 import cats.effect.*
 import cats.effect.implicits.*
 import cats.effect.std.*
@@ -268,17 +268,15 @@ object KafkaConsumer {
         ): OnRebalance[F] =
           OnRebalance(
             onRevoked = revoked => {
-              val finishSignals = for {
+              for {
                 finishers <- assignmentRef.modify(_.partition(entry => !revoked.contains(entry._1)))
-                revokeFinishers  <- finishers
-                  .toVector
+                revokeFinishers  <- Chain
+                  .fromIterableOnce(finishers)
                   .traverse {
                     case (_, assignmentSignals) =>
                       assignmentSignals.signalStreamToTerminate.as(assignmentSignals.awaitStreamFinishedSignal)
                   }
               } yield revokeFinishers
-
-              finishSignals.flatMap(revokes => revokes.sequence_)
             },
             onAssigned = assignedPartitions => {
               for {
@@ -447,7 +445,9 @@ object KafkaConsumer {
                 assignmentRef.updateAndGet(_ ++ assigned).flatMap(updateQueue.offer),
             onRevoked = revoked =>
               initialAssignmentDone >>
-                assignmentRef.updateAndGet(_ -- revoked).flatMap(updateQueue.offer)
+                assignmentRef.updateAndGet(_ -- revoked)
+                  .flatMap(updateQueue.offer)
+                  .as(Chain.empty)
           )
 
         Stream

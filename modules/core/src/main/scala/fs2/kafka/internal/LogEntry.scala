@@ -223,6 +223,16 @@ private[kafka] object LogEntry {
 
   }
 
+  final case class RevokeTimeoutOccurred[F[_]](
+    revoked: Set[TopicPartition],
+    state: State[F, ?, ?]
+  ) extends LogEntry {
+    override def level: LogLevel = Info
+
+    override def message: String =
+      s"Consuming streams did not signal processing completion of [$revoked]. Current state [$state]."
+  }
+
   def recordsString[F[_]](
     records: Records[F]
   ): String =

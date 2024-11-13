@@ -223,14 +223,24 @@ final private[kafka] class KafkaConsumerActor[F[_], K, V](
         )).run(withRebalancing)
       }
       .flatMap { res =>
-        val onRevoked =
-          res.onRebalances.foldLeft(F.unit)(_ >> _.onRevoked(revoked))
+        val onRevokedStarted =
+          res.onRebalances.foldLeft(F.pure(Chain.empty[F[Unit]])) { (acc, next) =>
+            for {
+              acc <- acc
+              next <- next.onRevoked(revoked)
+            } yield acc ++ next
+          }
 
         res.logRevoked >>
           res.completeWithRecords >>
           res.completeWithoutRecords >>
           res.removeRevokedRecords >>
-          onRevoked.timeout(settings.sessionTimeout) //just to be extra-safe timeout this revoke
+          onRevokedStarted //first we need to trigger interruption for all the consuming streams
+            .flatMap(_.sequence_) //second we await for all the streams to finish processing (Eager mode returns immediately)
+            .timeoutTo(
+              settings.sessionTimeout,
+              ref.get.flatMap(state => log(LogEntry.RevokeTimeoutOccurred(revoked, state)))
+            )
       }
   }
 
@@ -630,7 +640,7 @@ private[kafka] object KafkaConsumerActor {
 
   final case class OnRebalance[F[_]](
     onAssigned: SortedSet[TopicPartition] => F[Unit],
-    onRevoked: SortedSet[TopicPartition] => F[Unit],
+    onRevoked: SortedSet[TopicPartition] => F[Chain[F[Unit]]],
   ) {
 
     override def toString: String =
