@@ -7,12 +7,10 @@
 package fs2.kafka
 
 import java.util
-
 import scala.annotation.nowarn
 import scala.collection.immutable.SortedSet
 import scala.concurrent.duration.FiniteDuration
 import scala.util.matching.Regex
-
 import cats.{Applicative, Foldable, Functor, Reducible}
 import cats.data.{NonEmptySet, OptionT}
 import cats.effect.*
@@ -27,9 +25,10 @@ import fs2.kafka.internal.*
 import fs2.kafka.internal.converters.collection.*
 import fs2.kafka.internal.syntax.*
 import fs2.kafka.internal.KafkaConsumerActor.*
-
 import org.apache.kafka.clients.consumer.{OffsetAndMetadata, OffsetAndTimestamp}
 import org.apache.kafka.common.{Metric, MetricName, PartitionInfo, TopicPartition}
+
+import java.util.UUID
 
 /**
   * [[KafkaConsumer]] represents a consumer of Kafka records, with the ability to `subscribe` to
@@ -212,8 +211,12 @@ object KafkaConsumer {
                   (partition -> AssignmentSignals.eager[F]).pure[F]
                 case RebalanceRevokeMode.GracefulMode =>
                   Deferred[F, Unit].map(revokeFinisher =>
-                    partition -> AssignmentSignals.graceful(revokeFinisher)
+                    partition -> AssignmentSignals.graceful(partition, revokeFinisher)
                   )
+                  .flatTap {
+                    case (_, signals) =>
+                      println(s"Got signals: $signals").pure[F]
+                  }
               }
             }
             .map(_.toMap)
@@ -755,10 +758,11 @@ object KafkaConsumer {
     def eager[F[_]: Applicative]: AssignmentSignals[F] =
       EagerSignals()
 
-    def graceful[F[_]](
+    def graceful[F[_]: Functor](
+      topicPartition: TopicPartition,
       revokeFinisher: Deferred[F, Unit]
     ): AssignmentSignals[F] =
-      GracefulSignals[F](revokeFinisher)
+      GracefulSignals[F](topicPartition, UUID.randomUUID(), revokeFinisher)
 
     final private case class EagerSignals[F[_]: Applicative]() extends AssignmentSignals[F] {
 
@@ -767,12 +771,16 @@ object KafkaConsumer {
 
     }
 
-    final private case class GracefulSignals[F[_]](
+    final private case class GracefulSignals[F[_]: Functor](
+      topicPartition: TopicPartition,
+      id: UUID,
       revokeFinisher: Deferred[F, Unit]
     ) extends AssignmentSignals[F] {
 
       override def signalStreamFinished: F[Boolean]   = revokeFinisher.complete(())
-      override def awaitStreamFinishedSignal: F[Unit] = revokeFinisher.get
+      override def awaitStreamFinishedSignal: F[Unit] = revokeFinisher.get.map { _ =>
+        println(s"Finished stream for $topicPartition with id $id")
+      }
 
     }
 

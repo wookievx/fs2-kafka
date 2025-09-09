@@ -1239,15 +1239,10 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
   describe("KafkaConsumer#stream") {
     it("should wait for previous generation of streams to finish before starting consuming messages with RebalanceRevokeMode#Graceful") {
       withTopic { topic =>
-        case class RecordedMessage(consumer: String, key: String, value: String)
-        createCustomTopic(topic, partitions = 2) // minimal amount of partitions for two consumers
+        createCustomTopic(topic, partitions = 4) // minimal amount of partitions for two consumers
+
         def recordRange(from: Int, _until: Int) =
           (from until _until).map(n => s"key-$n" -> s"value-$n")
-
-        def produceRange(from: Int, until: Int): IO[Unit] = IO {
-          val produced = recordRange(from, until)
-          publishToKafka(topic, produced)
-        }
 
         val settings = consumerSettings[IO]
           .withGroupId("rebalance-test-group")
@@ -1255,71 +1250,91 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
           .withAutoOffsetReset(AutoOffsetReset.EarliestOffsetReset)
           .withSessionTimeout(7.seconds)
 
+        val recordsFrom = 0
+        val recordsTo   = 20
+        val records     = recordRange(recordsFrom, recordsTo)
+
+        val GlobalConsumerTimeout = 10.seconds
+
         val consumed = for {
+          _                      <- IO.delay(publishToKafka(topic, records))
           secondStreamSubscribed <- Semaphore[IO](0)
           longOperation          <- Semaphore[IO](0)
           processingUniqueness   <- Ref.of[IO, Map[String, Semaphore[IO]]](Map.empty)
           semaphoreForKey = (key: String) =>
-                              processingUniqueness.modify { map =>
-                                map.get(key) match {
-                                  case Some(sem) => (map, sem)
-                                  case None =>
-                                    val sem = Semaphore[IO](1).unsafeRunSync()
-                                    (map.updated(key, sem), sem)
-                                }
-                              }
-          _ <- produceRange(0, 10)
-          concurrentProcessingDetected <-
-            KafkaConsumer
-              .stream(settings)
-              .evalTap(_.subscribeTo(topic))
-              .flatMap(
-                _.stream
-                  .evalMap { r =>
-                    semaphoreForKey(r.record.key).flatMap(
-                      _.permit
+            processingUniqueness.modify { map =>
+              map.get(key) match {
+                case Some(sem) => (map, sem)
+                case None =>
+                  val sem = Semaphore[IO](1).unsafeRunSync()
+                  (map.updated(key, sem), sem)
+              }
+            }
+          consumer1 = KafkaConsumer
+            .stream(settings)
+            .evalTap(_.subscribeTo(topic))
+            .flatMap(
+              _.stream
+                .evalMap { r =>
+                  IO.uncancelable { _ =>
+                    for {
+                      _         <- IO.println("Consumer1 started processing " + r.record.key)
+                      semaphore <- semaphoreForKey(r.record.key)
+                      _ <- semaphore
+                        .permit
                         .use { _ =>
                           if (r.record.key == "key-4") {
-                            secondStreamSubscribed.release *> longOperation.acquire *> r
-                              .offset
-                              .commit
-                              .as(
-                                RecordedMessage("1", r.record.key, r.record.value)
-                              )
+                            secondStreamSubscribed.release *>
+                              longOperation.acquire *>
+                              IO.sleep(2.seconds) *>
+                              r.offset.commit
                           } else {
-                            r.offset.commit
+                            IO.sleep(100.millis) *>
+                              r.offset.commit
                           }
                         }
-                    )
+                      _ <- IO.println("Consumer1 finished processing " + r.record.key)
+                    } yield ()
                   }
-                  .interruptAfter(5.seconds)
-              )
-              .compile
-              .drain
-              .both {
-                KafkaConsumer
-                  .stream(settings)
-                  .evalTap(_ => secondStreamSubscribed.acquire)
-                  .evalTap(_.subscribeTo(topic))
-                  .evalTap(_ => longOperation.release)
-                  .flatMap(c =>
-                    // infinite stream
-                    c.stream
-                      .evalMap { record =>
-                        semaphoreForKey(record.record.key).flatMap(_.tryAcquire)
-                      }
-                      .collectFirst { case false => true }
-                  )
-                  .compile
-                  .lastOrError
-                  .timeoutTo(5.seconds, IO.pure(false))
-              }
-              .map(_._2)
+                }
+                .interruptAfter(GlobalConsumerTimeout)
+            )
+            .compile
+            .drain
+          consumer2 = KafkaConsumer
+            .stream(settings)
+            .evalTap(_ => secondStreamSubscribed.acquire)
+            .evalTap(_.subscribeTo(topic))
+            .evalTap(_ => longOperation.release)
+            .flatMap(c =>
+              // infinite stream
+              c.stream
+                .evalMap { record =>
+                  for {
+                    _ <- IO.println("Consumer2 started processing " + record.record.key)
+                    isSemaphoreAvailable <-
+                      semaphoreForKey(record.record.key).flatMap(_.tryAcquire)
+                    _              <- IO.sleep(10.millis)
+                    semaphoreStatus = if (isSemaphoreAvailable) "" else "[!!!]"
+                    _ <- IO.println(
+                      s"${semaphoreStatus}Consumer2 finished processing " + record
+                        .record
+                        .key
+                    )
+                  } yield isSemaphoreAvailable
+
+                }
+                .collectFirst { case false => true }
+            )
+            .compile
+            .lastOrError
+            .timeoutTo(GlobalConsumerTimeout, IO.pure(false))
+          concurrentProcessingDetected <- consumer1.both(consumer2).map(_._2)
         } yield concurrentProcessingDetected
 
         val concurrentProcessingDetected = consumed.unsafeRunSync()
 
-        // no single key should be processed concurrently
+        println(s"concurrentProcessingDetected: $concurrentProcessingDetected")
         concurrentProcessingDetected shouldBe false
       }
     }

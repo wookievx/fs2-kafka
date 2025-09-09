@@ -70,8 +70,10 @@ final private[kafka] class KafkaConsumerActor[F[_], K, V](
   val consumerRebalanceListener: ConsumerRebalanceListener =
     new ConsumerRebalanceListener {
 
-      override def onPartitionsRevoked(partitions: util.Collection[TopicPartition]): Unit =
+      override def onPartitionsRevoked(partitions: util.Collection[TopicPartition]): Unit = {
         dispatcher.unsafeRunSync(revoked(partitions.toSortedSet))
+        println(s"Executed call-back for partitions: ${partitions.toSortedSet}")
+      }
 
       override def onPartitionsAssigned(partitions: util.Collection[TopicPartition]): Unit =
         dispatcher.unsafeRunSync(assigned(partitions.toSortedSet))
